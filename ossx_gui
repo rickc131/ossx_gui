@@ -1,0 +1,285 @@
+import csv
+import time
+import warnings
+import xml.etree.ElementTree as ET
+import requests
+import urllib3
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from tkinter.scrolledtext import ScrolledText
+
+# 忽略InsecureRequestWarning警告
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+
+class BucketScannerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("存储桶遍历工具")
+        self.root.geometry("800x600")
+        
+        # 用来统计所有key的列表
+        self.total_keys = []
+        self.current_page = 0
+        self.csv_filename = ""
+        self.child_tags = []
+        self.maxkey = 0
+        self.is_running = False
+        
+        self.create_widgets()
+    
+    def create_widgets(self):
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # URL输入部分
+        url_frame = ttk.LabelFrame(main_frame, text="存储桶配置", padding="10")
+        url_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(url_frame, text="存储桶遍历URL:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.url_entry = ttk.Entry(url_frame, width=60)
+        self.url_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        
+        ttk.Label(url_frame, text="存储桶根路径(可选):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.baseurl_entry = ttk.Entry(url_frame, width=60)
+        self.baseurl_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+        
+        # 按钮部分
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=5)
+        
+        self.start_btn = ttk.Button(button_frame, text="开始扫描", command=self.start_scan)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(button_frame, text="停止扫描", command=self.stop_scan, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.save_btn = ttk.Button(button_frame, text="保存结果", command=self.save_results, state=tk.DISABLED)
+        self.save_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 状态显示部分
+        status_frame = ttk.LabelFrame(main_frame, text="扫描状态", padding="10")
+        status_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.status_text = ScrolledText(status_frame, height=15, wrap=tk.WORD)
+        self.status_text.pack(fill=tk.BOTH, expand=True)
+        
+        # 进度条
+        self.progress = ttk.Progressbar(main_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress.pack(fill=tk.X, pady=5)
+        
+        # 日志级别
+        log_frame = ttk.Frame(main_frame)
+        log_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(log_frame, text="日志级别:").pack(side=tk.LEFT, padx=5)
+        self.log_level = tk.StringVar(value="INFO")
+        ttk.Radiobutton(log_frame, text="详细", variable=self.log_level, value="DEBUG").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(log_frame, text="一般", variable=self.log_level, value="INFO").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(log_frame, text="警告", variable=self.log_level, value="WARNING").pack(side=tk.LEFT, padx=5)
+    
+    def log(self, message, level="INFO"):
+        if level == "DEBUG" and self.log_level.get() != "DEBUG":
+            return
+        if level == "INFO" and self.log_level.get() == "WARNING":
+            return
+            
+        self.status_text.insert(tk.END, f"[{level}] {message}\n")
+        self.status_text.see(tk.END)
+        self.root.update()
+    
+    def start_scan(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showerror("错误", "请输入存储桶遍历URL!")
+            return
+            
+        baseUrl = self.baseurl_entry.get().strip()
+        if not baseUrl:
+            baseUrl = url
+        if not baseUrl.endswith('/'):
+            baseUrl += '/'
+            
+        self.url = url
+        self.baseUrl = baseUrl
+        self.is_running = True
+        self.current_page = 0
+        self.total_keys = []
+        
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.save_btn.config(state=tk.DISABLED)
+        self.status_text.delete(1.0, tk.END)
+        
+        try:
+            self.log("正在获取存储桶基本信息...")
+            self.maxkey, nextmarker, self.csv_filename, self.child_tags = self.get_info()
+            
+            if len(self.child_tags) != 0:
+                self.log("XML数据提取成功！✨")
+                if self.maxkey is None:
+                    self.maxkey = 1000
+                self.log(f"该存储桶默认每页显示{self.maxkey}条数据")
+                
+                if nextmarker is None:
+                    self.log("该存储桶不支持Web翻页遍历", "WARNING")
+                else:
+                    self.log("该存储桶支持遍历,正在获取文件及数量...")
+                
+                self.get_data()
+            else:
+                self.log("该存储桶不支持遍历,或检查网址是否有误！", "WARNING")
+                self.stop_scan()
+                
+        except Exception as e:
+            self.log(f"XML解析有误，无法遍历: {str(e)}", "ERROR")
+            self.stop_scan()
+    
+    def stop_scan(self):
+        self.is_running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        if self.csv_filename and len(self.total_keys) > 0:
+            self.save_btn.config(state=tk.NORMAL)
+    
+    def save_results(self):
+        if not self.csv_filename:
+            messagebox.showerror("错误", "没有可保存的结果!")
+            return
+            
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
+            initialfile=self.csv_filename
+        )
+        
+        if save_path:
+            try:
+                import shutil
+                shutil.copy(self.csv_filename, save_path)
+                messagebox.showinfo("成功", f"结果已保存到: {save_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存文件时出错: {str(e)}")
+    
+    def get_info(self):
+        response = requests.get(self.url, verify=False)
+        xml_content = response.content
+        root = ET.fromstring(xml_content)
+        
+        maxkey = root.findtext(".//MaxKeys")
+        nextmarker = root.find(".//NextMarker")
+        xpath_expr = ".//Contents"
+        
+        has_namespace = root.tag.startswith("{")
+        if has_namespace:
+            namespace = root.tag.split('}')[0].strip('{')
+            xpath_expr = f".//{{{namespace}}}Contents"
+            maxkey = root.findtext(f".//{{{namespace}}}MaxKeys")
+            nextmarker = root.find(f".//{{{namespace}}}NextMarker")
+        
+        child_tags = set()
+        for contents_element in root.findall(xpath_expr):
+            for child_element in contents_element:
+                if has_namespace:
+                    child_tags.add(child_element.tag.replace(f"{{{namespace}}}", ""))
+                else:
+                    child_tags.add(child_element.tag)
+        
+        filename = self.write_csv_header(child_tags)
+        return maxkey, nextmarker, filename, child_tags
+    
+    def write_csv_header(self, child_tags):
+        timestamp = int(time.time())
+        self.csv_filename = f'xml_data{timestamp}.csv'
+        
+        with open(self.csv_filename, 'w', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            list_tags = list(child_tags)
+            list_tags.append("url")
+            list_tags.append("filetype")
+            writer.writerow(list_tags)
+            
+        return self.csv_filename
+    
+    def get_data(self, marker=''):
+        if not self.is_running:
+            return
+            
+        max_keys = 1000 if self.maxkey is None or int(self.maxkey) < 1000 else int(self.maxkey)
+        url = self.url + f'?max-keys={max_keys}&marker={marker}'
+        
+        try:
+            response = requests.get(url, verify=False)
+            xml_content = response.content
+            root = ET.fromstring(xml_content)
+            
+            namespace = ''
+            xpath_expr = ".//Contents"
+            nextmarker = root.findtext(".//NextMarker")
+            
+            has_namespace = root.tag.startswith("{")
+            if has_namespace:
+                namespace = root.tag.split('}')[0].strip('{')
+                xpath_expr = f".//{{{namespace}}}Contents"
+                nextmarker = root.findtext(f".//{{{namespace}}}NextMarker")
+            
+            datas = root.findall(xpath_expr)
+            nums, is_repeate, repeate_nums, total_nums = self.write_csv_content(datas, has_namespace, namespace)
+            
+            self.current_page += 1
+            self.log(f"第{self.current_page}页检测到{nums}条数据,共计发现{total_nums}个文件")
+            
+            # 更新进度条
+            if total_nums > 0:
+                self.progress["value"] = min(100, (len(self.total_keys) / (total_nums + 1)) * 100)
+                self.root.update()
+            
+            if nextmarker is None or is_repeate == 1:
+                self.log(f"扫描完成! 结果已保存到: {self.csv_filename}", "SUCCESS")
+                self.stop_scan()
+                return
+                
+            self.get_data(nextmarker)
+            
+        except Exception as e:
+            self.log(f"获取数据时出错: {str(e)}", "ERROR")
+            self.stop_scan()
+    
+    def write_csv_content(self, datas, has_namespace, namespace):
+        nums = 0
+        repeate_nums = 0
+        is_repeate = 0
+        
+        with open(self.csv_filename, 'a', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            
+            for contents_element in datas:
+                if has_namespace:
+                    row = [contents_element.findtext(f"{{{namespace}}}{tag}") for tag in self.child_tags]
+                    key = contents_element.findtext(f"{{{namespace}}}Key")
+                else:
+                    row = [contents_element.findtext(tag) for tag in self.child_tags]
+                    key = contents_element.findtext("Key")
+                
+                if str(key) not in self.total_keys:
+                    nums += 1
+                    self.total_keys.append(key)
+                    url = str(self.baseUrl) + str(key)
+                    parts = str(key).split(".")
+                    file_extension = parts[-1] if len(parts) > 1 else ""
+                    
+                    row.append(url)
+                    row.append(file_extension)
+                    writer.writerow(row)
+                else:
+                    repeate_nums += 1
+                    
+            if repeate_nums > 2:
+                is_repeate = 1
+                
+        return nums, is_repeate, repeate_nums, len(self.total_keys)
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = BucketScannerApp(root)
+    root.mainloop()
